@@ -145,6 +145,7 @@ def run_once():
 
 
 def run_forever():
+    send_telegram_message(f"Bot demarre - symboles surveilles: {', '.join(SYMBOLS)}")
     while True:
         try:
             run_once()
