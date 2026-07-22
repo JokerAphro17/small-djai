@@ -1,9 +1,16 @@
 """
 Bot de trading algorithmique pour actions US via Alpaca (paper trading par defaut).
 
-Strategie : croisement de moyennes mobiles (SMA courte / SMA longue).
-- Achat quand la SMA courte croise au-dessus de la SMA longue.
-- Vente quand la SMA courte croise en dessous.
+Strategies (actives en parallele, chacune peut declencher un ordre) :
+  1. SMA - croisement de moyennes mobiles (SMA courte / SMA longue).
+     - Achat quand la SMA courte croise au-dessus de la SMA longue.
+     - Vente quand la SMA courte croise en dessous.
+  2. RSI - retour a la moyenne sur l'indice de force relative (14 jours).
+     - Achat quand le RSI casse sous 30 (survente).
+     - Vente quand le RSI casse au-dessus de 70 (surachat).
+
+Les deux strategies sont independantes : un ordre part des qu'au moins une
+d'elles donne un signal (dans la limite d'une position par symbole).
 
 AVERTISSEMENT : ceci est un point de depart educatif, pas un conseil financier.
 Le trading algorithmique comporte un risque reel de perte en capital, meme
@@ -43,6 +50,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pandas as pd
 import requests
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
@@ -61,6 +69,17 @@ SYMBOLS = ["AAPL", "MSFT", "NVDA"]  # actions a surveiller
 SHORT_WINDOW = 20   # SMA courte (jours)
 LONG_WINDOW = 50    # SMA longue (jours)
 QTY_PER_ORDER = 1   # nombre d'actions par ordre
+
+# Strategie RSI (retour a la moyenne)
+RSI_PERIOD = 14     # periode de calcul du RSI (jours)
+RSI_OVERSOLD = 30   # seuil de survente -> signal d'achat
+RSI_OVERBOUGHT = 70 # seuil de surachat -> signal de vente
+
+# Strategies actives (chacune peut declencher un ordre independamment)
+ACTIVE_STRATEGIES = ["sma", "rsi"]
+
+# Nombre de bougies journalieres a recuperer (marge pour week-ends/feries)
+LOOKBACK_DAYS = LONG_WINDOW * 3
 CHECK_INTERVAL_SECONDS = 60 * 60  # verifie une fois par heure (strategie SMA)
 MARKET_CHECK_INTERVAL_SECONDS = 60  # verifie l'etat du marche (ouvert/ferme) chaque minute
 
@@ -113,10 +132,11 @@ def get_account():
     return trading_client.get_account()
 
 
-def get_sma_signal(symbol: str) -> str:
-    """Retourne 'buy', 'sell' ou 'hold' selon le croisement de moyennes mobiles."""
+def fetch_closes(symbol: str) -> pd.Series | None:
+    """Recupere les cours de cloture journaliers. Retourne None si indisponible.
+    Partage par toutes les strategies pour eviter des appels API redondants."""
     end = datetime.now()
-    start = end - timedelta(days=LONG_WINDOW * 3)  # marge pour jours feries/week-ends
+    start = end - timedelta(days=LOOKBACK_DAYS)  # marge pour jours feries/week-ends
 
     request = StockBarsRequest(
         symbol_or_symbols=symbol,
@@ -125,11 +145,16 @@ def get_sma_signal(symbol: str) -> str:
         end=end,
     )
     bars = data_client.get_stock_bars(request).df
+    if bars.empty:
+        return None
+    return bars["close"]
 
-    if bars.empty or len(bars) < LONG_WINDOW:
+
+def sma_signal(closes: pd.Series) -> str:
+    """'buy'/'sell'/'hold' selon le croisement des moyennes mobiles."""
+    if len(closes) < LONG_WINDOW:
         return "hold"
 
-    closes = bars["close"]
     sma_short = closes.rolling(SHORT_WINDOW).mean()
     sma_long = closes.rolling(LONG_WINDOW).mean()
 
@@ -143,6 +168,41 @@ def get_sma_signal(symbol: str) -> str:
     return "hold"
 
 
+def compute_rsi(closes: pd.Series, period: int) -> pd.Series:
+    """RSI classique (moyenne mobile simple des gains/pertes)."""
+    delta = closes.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def rsi_signal(closes: pd.Series) -> str:
+    """'buy' quand le RSI casse sous 30, 'sell' quand il casse au-dessus de 70."""
+    if len(closes) < RSI_PERIOD + 1:
+        return "hold"
+
+    rsi = compute_rsi(closes, RSI_PERIOD)
+    prev, curr = rsi.iloc[-2], rsi.iloc[-1]
+    if pd.isna(prev) or pd.isna(curr):
+        return "hold"
+
+    if prev >= RSI_OVERSOLD and curr < RSI_OVERSOLD:
+        return "buy"
+    if prev <= RSI_OVERBOUGHT and curr > RSI_OVERBOUGHT:
+        return "sell"
+    return "hold"
+
+
+# Registre des strategies : nom -> fonction de signal
+STRATEGY_FUNCS = {
+    "sma": sma_signal,
+    "rsi": rsi_signal,
+}
+
+
 def has_open_position(symbol: str) -> bool:
     try:
         trading_client.get_open_position(symbol)
@@ -151,7 +211,7 @@ def has_open_position(symbol: str) -> bool:
         return False
 
 
-def place_order(symbol: str, side: OrderSide):
+def place_order(symbol: str, side: OrderSide, reasons: list[str]):
     order = MarketOrderRequest(
         symbol=symbol,
         qty=QTY_PER_ORDER,
@@ -164,7 +224,8 @@ def place_order(symbol: str, side: OrderSide):
         print(f"[{datetime.now()}] Echec ordre {side.value} pour {symbol}: {e}")
         return
 
-    message = f"Ordre {side.value.upper()} execute pour {QTY_PER_ORDER} {symbol}"
+    origine = "+".join(reasons).upper()
+    message = f"Ordre {side.value.upper()} execute pour {QTY_PER_ORDER} {symbol} [{origine}]"
     print(f"[{datetime.now()}] {message}")
     send_telegram_message(f"OK - {message}")
 
@@ -176,15 +237,31 @@ def run_once():
         return
 
     for symbol in SYMBOLS:
-        signal = get_sma_signal(symbol)
+        closes = fetch_closes(symbol)
+        if closes is None:
+            print(f"[{datetime.now()}] {symbol}: pas de donnees, on passe")
+            continue
+
         owns_it = has_open_position(symbol)
 
-        if signal == "buy" and not owns_it:
-            place_order(symbol, OrderSide.BUY)
-        elif signal == "sell" and owns_it:
-            place_order(symbol, OrderSide.SELL)
+        # Chaque strategie active vote independamment.
+        buy_reasons, sell_reasons = [], []
+        for name in ACTIVE_STRATEGIES:
+            signal = STRATEGY_FUNCS[name](closes)
+            if signal == "buy":
+                buy_reasons.append(name)
+            elif signal == "sell":
+                sell_reasons.append(name)
+
+        if buy_reasons and not owns_it:
+            place_order(symbol, OrderSide.BUY, buy_reasons)
+        elif sell_reasons and owns_it:
+            place_order(symbol, OrderSide.SELL, sell_reasons)
         else:
-            print(f"[{datetime.now()}] {symbol}: signal={signal}, position={owns_it}, rien a faire")
+            print(
+                f"[{datetime.now()}] {symbol}: buy={buy_reasons or '-'}, "
+                f"sell={sell_reasons or '-'}, position={owns_it}, rien a faire"
+            )
 
 
 def market_watcher(state: dict):
